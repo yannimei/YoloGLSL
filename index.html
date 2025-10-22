@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGL Video Effects</title>
+  <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: Arial, sans-serif;
+      background: #f0f0f0;
+    }
+    .container {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+    }
+    .video-section {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    video, canvas {
+      width: 640px;
+      height: 480px;
+      border: 2px solid #333;
+      border-radius: 8px;
+    }
+    .label {
+      font-weight: bold;
+      color: #333;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="video-section">
+      <div class="label">Original Webcam</div>
+      <video id="video" autoplay muted playsinline></video>
+    </div>
+    
+    <div class="video-section">
+      <div class="label">WebGL Effects</div>
+      <canvas id="canvas" width="640" height="480"></canvas>
+      <div style="margin-top: 10px;">
+        <button id="toggleML5" style="padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">
+          Enable ML5 Detection
+        </button>
+      </div>
+    </div>
+  </div>
+
+
+
+
+  <script type="module">
+    import { VideoEffectsApp } from './public/js/webglApp.js';
+
+    window.addEventListener('load', () => {
+      const app = new VideoEffectsApp({ videoSelector: '#video', canvasSelector: '#canvas' });
+      app.init();
+
+      // Toggle ML5 detection
+      const toggleBtn = document.getElementById('toggleML5');
+      toggleBtn.addEventListener('click', () => {
+        if (app.ml5Enabled) {
+          app.disableML5();
+          toggleBtn.textContent = 'Enable ML5 Detection';
+          toggleBtn.style.background = '#007bff';
+        } else {
+          app.enableML5();
+          toggleBtn.textContent = 'Disable ML5 Detection';
+          toggleBtn.style.background = '#dc3545';
+        }
+      });
+    });
+  </script>
+</body>
+</html>
