@@ -13,10 +13,22 @@ export class VideoEffectsApp {
     // ML5 properties
     this.ml5Enabled = false;
     this.detector = null;
-    // CHANGED: maintain bottle detection boxes (x,y,w,h) up to 16
-    this.bottleBoxes = new Float32Array(4 * 16);
-    this.nBottles = 0;
+    // Generalized detection buffers (max 16)
+    this.maxDetections = 16;
+    this.nDetections = 0;
+    this.detectionBoxes = new Float32Array(4 * this.maxDetections); // x,y,w,h in pixels
+    this.detectionClassIds = new Float32Array(this.maxDetections);   // mapped float class ids
+    this.detectionScores = new Float32Array(this.maxDetections);     // confidence [0,1]
+    this.latestDetections = [];
     this.detectionInterval = null;
+    this.detectionAdapter = null;
+    this.log = null;
+    this._fpsFrames = 0;
+    this._fpsLastTs = performance.now();
+    this._detectAvgMs = 0;
+    this._detectCount = 0;
+    this._logRender = false;
+    this._logDetect = false;
   }
 
   async init() {
@@ -28,6 +40,7 @@ export class VideoEffectsApp {
   initWebGL() {
     this.gl = this.canvas.getContext('webgl');
     if (!this.gl) throw new Error('WebGL not supported');
+    this.log?.('WebGL initialized');
 
     // Default shaders
     const vertexSrc = `
@@ -45,10 +58,13 @@ export class VideoEffectsApp {
       varying vec2 vUv;
       uniform sampler2D uVideo;
       uniform float uTime;
-      // CHANGED: only pass bottle detection boxes
-      uniform float u_nbottles;
-      uniform vec4 u_bottleBoxes[16]; // (x,y,w,h) in pixels
+      // Universal detection uniforms
+      uniform float u_numDetections;              // number of active detections (0..16)
+      uniform vec4 u_detectionBoxes[16];          // (x,y,w,h) in pixels
+      uniform float u_detectionClassIds[16];      // class id per detection (float)
+      uniform float u_detectionScores[16];        // confidence per detection
       uniform vec2 u_resolution;
+      
       
       void main() {
         vec4 videoColor = texture2D(uVideo, vUv);
@@ -58,33 +74,26 @@ export class VideoEffectsApp {
           // Base: use original video
           finalColor = videoColor.rgb;
 
-          // CHANGED: Bottle detection - turn red colors to yellow
-          if (u_nbottles > 0.0) {
+          // Example default effect: highlight any detection by boosting saturation inside boxes
+          if (u_numDetections > 0.0) {
             vec2 px = vUv * u_resolution;
-            bool inBottle = false;
+            bool inAny = false;
             for (int i = 0; i < 16; i++) {
-              if (float(i) >= u_nbottles) break;
-              vec4 b = u_bottleBoxes[i];
+              if (float(i) >= u_numDetections) break;
+              vec4 b = u_detectionBoxes[i];
               vec2 minB = b.xy;
               vec2 maxB = b.xy + b.zw;
               if (px.x >= minB.x && px.x <= maxB.x && px.y >= minB.y && px.y <= maxB.y) {
-                inBottle = true;
+                inAny = true;
                 break;
               }
             }
 
-            if (inBottle) {
-              // BOTTLE FILTER: Detect red colors and turn them yellow
-              vec3 original = finalColor;
-              
-              // Check if pixel is red-ish (red channel dominant)
-              float redness = original.r - max(original.g, original.b);
-              if (redness > 0.1) { // Threshold for red detection
-                // Convert red to yellow: keep red, boost green, reduce blue
-                finalColor.r = original.r; // Keep red component
-                finalColor.g = min(1.0, original.g + redness * 0.8); // Boost green
-                finalColor.b = max(0.0, original.b - redness * 0.3); // Reduce blue slightly
-              }
+            if (inAny) {
+              vec3 c = finalColor;
+              float l = dot(c, vec3(0.299, 0.587, 0.114));
+              finalColor = mix(vec3(l), c, 1.4);
+              finalColor = clamp(finalColor, 0.0, 1.0);
             }
           }
         } else {
@@ -111,6 +120,7 @@ export class VideoEffectsApp {
 
   // Allow dynamic replacement of fragment shader source
   setFragmentShader(source) {
+    const t0 = performance.now();
     const newFrag = this.createShader(this.gl.FRAGMENT_SHADER, source);
     if (!newFrag) return false;
     if (this.program) {
@@ -120,6 +130,8 @@ export class VideoEffectsApp {
       this.gl.linkProgram(this.program);
       this.gl.useProgram(this.program);
       this.fragmentShader = newFrag;
+      const dt = Math.round(performance.now() - t0);
+      this.log?.(`Shader compiled and linked in ${dt} ms`);
       return true;
     }
     return false;
@@ -131,6 +143,7 @@ export class VideoEffectsApp {
     this.gl.compileShader(shader);
     if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
       console.error('Shader compile error:', this.gl.getShaderInfoLog(shader));
+      this.log?.('Shader compile error (see console)');
       this.gl.deleteShader(shader);
       return null;
     }
@@ -165,16 +178,16 @@ export class VideoEffectsApp {
         resolve();
       };
     });
+    this.log?.('Webcam started');
   }
 
   enableML5() {
     if (this.ml5Enabled || !window.ml5) return;
     
-    console.log('Starting ML5 object detection...');
     this.ml5Enabled = true;
     
     this.detector = ml5.objectDetector('cocossd', () => {
-      console.log('ML5 detector ready');
+      this.log?.('ML5 COCO-SSD loaded');
       this.detectLoop();
     });
   }
@@ -182,10 +195,9 @@ export class VideoEffectsApp {
   disableML5() {
     if (!this.ml5Enabled) return;
     
-    console.log('Disabling ML5 detection...');
     this.ml5Enabled = false;
-    // CHANGED: clear bottle count when disabled
-    this.nBottles = 0;
+    // Clear detections when disabled
+    this.nDetections = 0;
     
     if (this.detectionInterval) {
       clearTimeout(this.detectionInterval);
@@ -200,18 +212,30 @@ export class VideoEffectsApp {
   detectLoop = () => {
     if (!this.ml5Enabled || !this.detector || !this.video) return;
     
+    const t0 = performance.now();
     this.detector.detect(this.video, (err, results) => {
       if (!err && results) {
-        // CHANGED: detect bottles for red-to-yellow color effect
-        const bottles = results.filter(r => r.label && r.label.toLowerCase() === 'bottle');
-        this.nBottles = Math.min(bottles.length, 16);
-        for (let i = 0; i < this.nBottles; i++) {
-          const r = bottles[i]; // {label, confidence, x, y, width, height}
+        this.latestDetections = results;
+        // Keep top N by confidence
+        const sorted = [...results].sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+        this.nDetections = Math.min(sorted.length, this.maxDetections);
+        for (let i = 0; i < this.nDetections; i++) {
+          const r = sorted[i]; // {label, confidence, x, y, width, height}
           const p = i * 4;
-          this.bottleBoxes[p + 0] = r.x;
-          this.bottleBoxes[p + 1] = r.y;
-          this.bottleBoxes[p + 2] = r.width;
-          this.bottleBoxes[p + 3] = r.height;
+          this.detectionBoxes[p + 0] = r.x;
+          this.detectionBoxes[p + 1] = r.y;
+          this.detectionBoxes[p + 2] = r.width;
+          this.detectionBoxes[p + 3] = r.height;
+          // Default class id is 0; adapter can remap labels later
+          this.detectionClassIds[i] = 0.0;
+          this.detectionScores[i] = r.confidence || 0.0;
+        }
+        const dt = performance.now() - t0;
+        // Exponential moving average for detection latency
+        this._detectAvgMs = this._detectAvgMs ? (0.9 * this._detectAvgMs + 0.1 * dt) : dt;
+        this._detectCount++;
+        if (this._logDetect && this._detectCount % 20 === 0) {
+          this.log?.(`Detection avg ${this._detectAvgMs.toFixed(1)} ms, n=${this.nDetections}`);
         }
       }
       
@@ -240,18 +264,66 @@ export class VideoEffectsApp {
       const resolutionLocation = this.gl.getUniformLocation(this.program, 'u_resolution');
       this.gl.uniform2f(resolutionLocation, this.canvas.width, this.canvas.height);
       
-      // CHANGED: upload bottle detection boxes
-      const nBottlesLoc = this.gl.getUniformLocation(this.program, 'u_nbottles');
-      this.gl.uniform1f(nBottlesLoc, this.nBottles);
-      if (this.nBottles > 0) {
-        const bottlesLoc = this.gl.getUniformLocation(this.program, 'u_bottleBoxes');
-        this.gl.uniform4fv(bottlesLoc, this.bottleBoxes);
+      // Upload detection uniforms through adapter if provided; else default
+      if (typeof this.detectionAdapter === 'function') {
+        this.detectionAdapter({
+          gl: this.gl,
+          program: this.program,
+          // raw buffers
+          nDetections: this.nDetections,
+          detectionBoxes: this.detectionBoxes,
+          detectionClassIds: this.detectionClassIds,
+          detectionScores: this.detectionScores,
+          latestDetections: this.latestDetections,
+          resolution: [this.canvas.width, this.canvas.height],
+        });
+      } else {
+        // Default mapping to universal uniforms
+        const nLoc = this.gl.getUniformLocation(this.program, 'u_numDetections');
+        this.gl.uniform1f(nLoc, this.nDetections);
+        if (this.nDetections > 0) {
+          const boxesLoc = this.gl.getUniformLocation(this.program, 'u_detectionBoxes');
+          this.gl.uniform4fv(boxesLoc, this.detectionBoxes);
+          const clsLoc = this.gl.getUniformLocation(this.program, 'u_detectionClassIds');
+          this.gl.uniform1fv(clsLoc, this.detectionClassIds);
+          const scrLoc = this.gl.getUniformLocation(this.program, 'u_detectionScores');
+          this.gl.uniform1fv(scrLoc, this.detectionScores);
+        }
       }
+
       
       this.gl.drawArrays(this.gl.TRIANGLE_STRIP, 0, 4);
     }
     requestAnimationFrame(() => this.animate());
+
+    // FPS reporting ~1 Hz
+    this._fpsFrames++;
+    const now = performance.now();
+    if (now - this._fpsLastTs >= 1000) {
+      const fps = Math.round((this._fpsFrames * 1000) / (now - this._fpsLastTs));
+      if (this._logRender) this.log?.(`Render FPS ${fps}, detections ${this.nDetections}`);
+      this._fpsFrames = 0;
+      this._fpsLastTs = now;
+    }
   }
 }
+
+// Allow callers (or generated code) to override how detections map to shader uniforms
+VideoEffectsApp.prototype.setDetectionAdapter = function(adapterFn) {
+  this.detectionAdapter = adapterFn;
+};
+
+// Optional logger hookup
+VideoEffectsApp.prototype.setLogger = function(logFn) {
+  this.log = typeof logFn === 'function' ? logFn : null;
+};
+
+// Enable/disable verbose logging categories
+VideoEffectsApp.prototype.setLoggingOptions = function(opts) {
+  if (!opts || typeof opts !== 'object') return;
+  if (typeof opts.render === 'boolean') this._logRender = opts.render;
+  if (typeof opts.detection === 'boolean') this._logDetect = opts.detection;
+};
+
 
 

@@ -31,6 +31,52 @@
       font-weight: bold;
       color: #333;
     }
+    .sidebar {
+      width: 380px;
+      background: #ffffff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 12px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .sidebar .section-title {
+      font-weight: bold;
+      color: #222;
+      margin-bottom: 4px;
+    }
+    .sidebar input[type="password"], .sidebar textarea {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      padding: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      background: #fafafa;
+    }
+    .sidebar textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      padding: 8px 12px;
+      background: #007bff;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .btn.secondary { background: #6c757d; }
+    .btn.warn { background: #dc3545; }
+    .small { font-size: 12px; color: #666; }
   </style>
 </head>
 <body>
@@ -49,6 +95,55 @@
         </button>
       </div>
     </div>
+
+    <div class="sidebar">
+      <div class="section-title">Chat-driven Shader Editor</div>
+      <div class="small">Provide your OpenAI API key to generate WebGL1 fragment shaders.</div>
+      <input id="apiKey" type="password" placeholder="sk-..." />
+      <div class="row">
+        <button id="saveKey" class="btn secondary">Save Key</button>
+        <button id="clearKey" class="btn warn">Clear Key</button>
+      </div>
+
+      <div class="section-title">Model</div>
+      <div class="row">
+        <select id="modelSelect" style="flex:1; padding:6px; border:1px solid #ccc; border-radius:6px; background:#fafafa; font-size:12px;">
+          <option value="gpt-5-mini">gpt-5-mini (new, fast)</option>
+          <option value="gpt-4o-mini">gpt-4o-mini (fast, good for code)</option>
+          <option value="gpt-4o">gpt-4o (balanced quality/speed)</option>
+          <option value="gpt-4.1-mini">gpt-4.1-mini (fast)</option>
+          <option value="gpt-4.1">gpt-4.1 (quality)</option>
+        </select>
+      </div>
+
+      <div class="row" style="align-items:center;">
+        <label style="display:flex; gap:6px; align-items:center;">
+          <input id="statelessMode" type="checkbox" checked /> Stateless (no chat history)
+        </label>
+      </div>
+
+      <div class="section-title">Prompt</div>
+      <textarea id="prompt" placeholder="e.g., I want to see the world like colorblind"></textarea>
+      <div class="row">
+        <button id="generateShader" class="btn">Generate Shader</button>
+        <button id="applyShader" class="btn secondary">Apply From Output</button>
+      </div>
+      <div class="small">Model will return a fragment shader. You can edit before applying.</div>
+      <textarea id="shaderOutput" placeholder="Model output (fragment shader)"></textarea>
+
+      <div class="section-title">System Log</div>
+      <div id="log" style="height: 200px; overflow:auto; background:#0b1020; color:#cde1ff; border-radius:6px; padding:8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:11px; line-height:1.4;"></div>
+      <div class="row" style="align-items:center;">
+        <label style="display:flex; gap:6px; align-items:center;">
+          <input id="toggleRenderLog" type="checkbox" /> Render FPS log
+        </label>
+        <label style="display:flex; gap:6px; align-items:center;">
+          <input id="toggleDetectLog" type="checkbox" /> Detection log
+        </label>
+      </div>
+
+      
+    </div>
   </div>
 
 
@@ -56,10 +151,45 @@
 
   <script type="module">
     import { VideoEffectsApp } from './public/js/webglApp.js';
+    import { generateShaderFromPrompt } from './public/js/openaiClient.js';
+    import { universalDetectionAdapter } from './public/js/detectionAdapters.js';
 
     window.addEventListener('load', () => {
       const app = new VideoEffectsApp({ videoSelector: '#video', canvasSelector: '#canvas' });
       app.init();
+      // set universal adapter (OpenAI can later overwrite by injecting code)
+      app.setDetectionAdapter?.(universalDetectionAdapter);
+
+      // Simple UI logger
+      const logEl = document.getElementById('log');
+      const maxLines = 200;
+      const log = (msg) => {
+        const ts = new Date().toLocaleTimeString();
+        const line = document.createElement('div');
+        line.textContent = `[${ts}] ${msg}`;
+        logEl.appendChild(line);
+        while (logEl.childElementCount > maxLines) {
+          logEl.removeChild(logEl.firstChild);
+        }
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+      app.setLogger?.(log);
+      log('App initialized');
+
+      // Logging toggles (default off for render/detection)
+      const toggleRenderLog = document.getElementById('toggleRenderLog');
+      const toggleDetectLog = document.getElementById('toggleDetectLog');
+      toggleRenderLog.checked = false;
+      toggleDetectLog.checked = false;
+      app.setLoggingOptions?.({ render: toggleRenderLog.checked, detection: toggleDetectLog.checked });
+      toggleRenderLog.addEventListener('change', () => {
+        app.setLoggingOptions?.({ render: toggleRenderLog.checked });
+        log(`Render logging ${toggleRenderLog.checked ? 'enabled' : 'disabled'}`);
+      });
+      toggleDetectLog.addEventListener('change', () => {
+        app.setLoggingOptions?.({ detection: toggleDetectLog.checked });
+        log(`Detection logging ${toggleDetectLog.checked ? 'enabled' : 'disabled'}`);
+      });
 
       // Toggle ML5 detection
       const toggleBtn = document.getElementById('toggleML5');
@@ -74,6 +204,101 @@
           toggleBtn.style.background = '#dc3545';
         }
       });
+
+      // Sidebar wiring
+      const apiKeyInput = document.getElementById('apiKey');
+      const saveKeyBtn = document.getElementById('saveKey');
+      const clearKeyBtn = document.getElementById('clearKey');
+      const promptEl = document.getElementById('prompt');
+      const generateBtn = document.getElementById('generateShader');
+      const applyBtn = document.getElementById('applyShader');
+      const shaderOutput = document.getElementById('shaderOutput');
+      const modelSelect = document.getElementById('modelSelect');
+      const statelessMode = document.getElementById('statelessMode');
+
+      // Load stored key
+      const storedKey = localStorage.getItem('openai_api_key');
+      if (storedKey) apiKeyInput.value = storedKey;
+      const storedModel = localStorage.getItem('openai_model');
+      if (storedModel) modelSelect.value = storedModel;
+      const storedStateless = localStorage.getItem('stateless_mode');
+      if (storedStateless != null) statelessMode.checked = storedStateless === '1';
+
+      saveKeyBtn.addEventListener('click', () => {
+        localStorage.setItem('openai_api_key', apiKeyInput.value.trim());
+        alert('API key saved locally.');
+      });
+      clearKeyBtn.addEventListener('click', () => {
+        localStorage.removeItem('openai_api_key');
+        apiKeyInput.value = '';
+        alert('API key cleared.');
+      });
+      modelSelect.addEventListener('change', () => {
+        localStorage.setItem('openai_model', modelSelect.value);
+        log(`Model set to ${modelSelect.value}`);
+      });
+      statelessMode.addEventListener('change', () => {
+        localStorage.setItem('stateless_mode', statelessMode.checked ? '1' : '0');
+        log(`Stateless mode ${statelessMode.checked ? 'enabled' : 'disabled'}`);
+      });
+
+      generateBtn.addEventListener('click', () => {
+        const text = promptEl.value.trim();
+        if (!text) {
+          alert('Enter a prompt first.');
+          return;
+        }
+        const promptLen = text.length;
+        const model = modelSelect.value;
+        const stateless = !!statelessMode.checked;
+        let currentShader = '';
+        if (!stateless) {
+          currentShader = shaderOutput.value.trim();
+          if (!currentShader) {
+            alert('Stateless is OFF. Provide a current shader to iterate on (paste or generate one first).');
+            log('Iterative mode aborted: no current shader present');
+            return;
+          }
+          log(`Iterative mode ON (base shader len=${currentShader.length})`);
+        }
+        log(`Sending prompt to OpenAI (model=${model}, len=${promptLen}, stateless=${stateless})`);
+        generateShaderFromPrompt({
+          promptText: text,
+          apiKeyInput,
+          model,
+          stateless,
+          currentShader,
+          onStatus: (s) => log(s),
+          onShader: (shader) => {
+            log('Shader received from model');
+            shaderOutput.value = shader;
+            const ok = app.setFragmentShader(shader);
+            if (!ok) {
+              log('Shader failed to compile');
+              alert('Shader failed to compile. You can edit it and click "Apply From Output".');
+            } else {
+              log('Shader compiled and applied');
+            }
+          },
+        });
+      });
+
+      applyBtn.addEventListener('click', () => {
+        const src = shaderOutput.value.trim();
+        if (!src) {
+          alert('No shader to apply.');
+          return;
+        }
+        const ok = app.setFragmentShader(src);
+        if (!ok) {
+          log('Manual apply: shader failed to compile');
+          alert('Shader failed to compile.');
+        } else {
+          log('Manual apply: shader compiled and applied');
+        }
+      });
+
+      // No preset buttons
     });
   </script>
 </body>
